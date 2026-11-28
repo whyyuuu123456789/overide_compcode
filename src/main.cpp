@@ -25,6 +25,13 @@ pros::Motor claw(10, pros::MotorGears::green);                 // Claw, port 10,
 // Inertial sensor (IMU) - any free port works, just change the number
 pros::Imu imu(20);
 
+// Match loader piston (used by pid_straight). Change 'A' to the 3-wire port it's plugged into.
+pros::adi::DigitalOut mlmech('A');
+
+// Blue cartridge top speed. pid_straight power is a percent of this.
+constexpr double DRIVE_MAX_RPM = 600.0;
+// Same top speed in motor degrees per second (600 rpm * 360 deg / 60 s = 3600 deg/s)
+constexpr double DRIVE_MAX_DEG_PER_SEC = DRIVE_MAX_RPM * 6.0;
 
 
 // Joystick values smaller than this are ignored, so stick drift doesn't move the robot
@@ -51,56 +58,7 @@ constexpr int JOINT_SPEED = 127;
 constexpr int CLAW_SPEED = 127;
 
 
-struct PID {
-	double kP, kI, kD;
-	double integral_zone; // the I term only builds up when |error| is smaller than this
-
-	double integral = 0;
-	double prev_error = 0;
-
-	PID(double p, double i, double d, double i_zone = 0)
-	    : kP(p), kI(i), kD(d), integral_zone(i_zone) {}
-
-	// Call before every new movement. Passing the first error stops a big D "kick" on the first loop.
-	void reset(double start_error) {
-		integral = 0;
-		prev_error = start_error;
-	}
-
-	double update(double error) {
-		if (std::fabs(error) < integral_zone) {
-			integral += error;
-		} else {
-			integral = 0;
-		}
-		if (error * prev_error < 0) {
-			integral = 0; // passed the target, so drop the built-up I to stop overshoot
-		}
-
-		double derivative = error - prev_error;
-		prev_error = error;
-
-		return kP * error + kI * integral + kD * derivative;
-	}
-};
-
-// ---------------------------------------------------------------------------
-// PID TUNING - start here when the robot overshoots, stops short, or wobbles
-//
-// How to tune (one controller at a time):
-//   1. Set kI and kD to 0. Raise kP until the robot reaches the target and
-//      oscillates a little around it.
-//   2. Raise kD until the oscillation goes away.
-//   3. If it stops a little short every time, add a small kI (try 0.05 - 0.2).
-// ---------------------------------------------------------------------------
-PID drive_pid(8.0, 0.0, 25.0, 3.0);   // error in inches  -> motor power
-PID heading_pid(2.0, 0.0, 6.0);       // error in degrees -> correction that keeps drives straight
-PID turn_pid(2.0, 0.0, 12.0, 15.0);   // error in degrees -> turning power
-
-constexpr double DRIVE_TOLERANCE = 0.; // inches: close enough to count as "arrived"
-constexpr double TURN_TOLERANCE  = 1.0; // degrees
-constexpr int    SETTLE_TIME_MS  = 100; // must stay inside the tolerance this long to finish
-constexpr int    LOOP_MS         = 10;
+constexpr int LOOP_MS = 10; // odometry loop speed
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -125,16 +83,18 @@ double drive_position_inches() {
 	return ((left + right) / 2.0) * INCHES_PER_DEGREE;
 }
 
-// Sets drive power (-127 to 127), scaling both sides down together if one is too big,
-// so the heading correction is never cut off
-void set_drive(double left, double right) {
-	double biggest = std::max(std::fabs(left), std::fabs(right));
-	if (biggest > 127) {
-		left  = left  * 127.0 / biggest;
-		right = right * 127.0 / biggest;
-	}
-	left_drive.move(static_cast<int>(left));
-	right_drive.move(static_cast<int>(right));
+// Spins each side at a percent (-100 to 100) of top speed, like VEXcode's spin(..., percent)
+void spin_drive_percent(double left_percent, double right_percent) {
+	left_drive.move_velocity(static_cast<int>(left_percent / 100.0 * DRIVE_MAX_RPM));
+	right_drive.move_velocity(static_cast<int>(right_percent / 100.0 * DRIVE_MAX_RPM));
+}
+
+// Sets each side's motor voltage as a percent (-100 to 100) of full power (12 V). Unlike
+// spin_drive_percent, the motors don't run their own speed control on top of this, so what the
+// PID asks for goes straight to the wheels. pid_turn uses this.
+void spin_drive_voltage_percent(double left_percent, double right_percent) {
+	left_drive.move_voltage(static_cast<int>(left_percent * 120.0)); // 100% = 12000 mV
+	right_drive.move_voltage(static_cast<int>(right_percent * 120.0));
 }
 
 void stop_drive() {
@@ -142,13 +102,71 @@ void stop_drive() {
 	right_drive.brake();
 }
 
-// ---------------------------------------------------------------------------
-// Position tracking (odometry) using the drive encoders + IMU
-//
-//   x: forward / back   (+x = forward from where the robot started)
-//   y: left / right     (+y = right)
-//   heading: degrees    (0 = facing +x, 90 = facing +y, i.e. turned right)
-// ---------------------------------------------------------------------------
+double percent_to_deg_per_sec(double percent) {
+	return percent / 100.0 * DRIVE_MAX_DEG_PER_SEC;
+}
+
+double deg_per_sec_to_percent(double deg_per_sec) {
+	return deg_per_sec / DRIVE_MAX_DEG_PER_SEC * 100.0;
+}
+
+
+struct ProfilePoint {
+	double pos; // where the robot should be
+	double vel; // how fast it should be going (units per second)
+};
+
+struct MotionProfile {
+	double sign;        // +1 forward / right, -1 backward / left
+	double distance;    // total distance, always positive
+	double accel;       // units per second per second
+	double peak_vel;    // top speed actually reached (below max_vel on short moves)
+	double accel_time;  // seconds spent speeding up (same time is spent slowing down)
+	double cruise_time; // seconds spent at peak_vel
+	double total_time;  // seconds for the whole move
+
+	MotionProfile(double signed_distance, double max_vel, double max_accel) {
+		sign = (signed_distance < 0) ? -1.0 : 1.0;
+		distance = std::fabs(signed_distance);
+		accel = max_accel;
+
+		// Fastest speed reachable while still leaving room to stop
+		peak_vel = std::min(max_vel, std::sqrt(distance * max_accel));
+		if (peak_vel <= 0) { // zero-length move (or bad settings): nothing to plan
+			accel_time = cruise_time = total_time = 0;
+			return;
+		}
+		accel_time = peak_vel / accel;
+		double accel_distance = 0.5 * accel * accel_time * accel_time;
+		cruise_time = std::max(0.0, (distance - 2.0 * accel_distance) / peak_vel);
+		total_time = 2.0 * accel_time + cruise_time;
+	}
+
+	// Target position and velocity `t` seconds after the move started
+	ProfilePoint sample(double t) const {
+		double pos, vel;
+		if (t <= 0) {                                      // not started
+			pos = 0;
+			vel = 0;
+		} else if (t < accel_time) {                       // speeding up
+			pos = 0.5 * accel * t * t;
+			vel = accel * t;
+		} else if (t < accel_time + cruise_time) {         // cruising
+			pos = 0.5 * accel * accel_time * accel_time + peak_vel * (t - accel_time);
+			vel = peak_vel;
+		} else if (t < total_time) {                       // slowing down
+			double time_left = total_time - t;
+			pos = distance - 0.5 * accel * time_left * time_left;
+			vel = accel * time_left;
+		} else {                                           // finished
+			pos = distance;
+			vel = 0;
+		}
+		return {pos * sign, vel * sign};
+	}
+};
+
+
 double robot_x = 0;
 double robot_y = 0;
 pros::Mutex pose_mutex;
@@ -183,78 +201,270 @@ void set_pose(double x, double y, double heading) {
 	imu.set_heading(heading);
 }
 
-// Drive straight forward (positive) or backward (negative) a number of inches.
-// Uses the encoders for distance and the IMU to stay pointed straight.
-void drive_distance(double inches, int max_speed = 127, int timeout_ms = 3000) {
-	double start_inches   = drive_position_inches();
-	double target_heading = imu.get_heading();
+void pid_turn(double delta) {
+	double kp = 2.4;         // power (percent) per degree left to turn
+	double ki = 0.04;        // builds extra power the longer the robot sits short of the target
+	double kd = 16.0;        // brakes the turn: power per degree the error changed since last loop
+	double i_zone = 15.0;    // degrees: ki only builds up once the robot is this close
+	double max_power = 70.0; // percent of full power
+	double tolerance = 1.0;  // degrees from the final angle that counts as "there"
+	int settle_loops = 10;   // loops (10 ms each) the robot must stay inside tolerance to finish
+	int timeout_ms = 2000;   // give up after this long
+	bool print_debug = true; // true = print time, angle, error, power to the PROS terminal each loop
 
-	drive_pid.reset(inches);
-	heading_pid.reset(0);
+	double dest_angle = imu.get_rotation() + delta;
+	double last_error = delta; // start equal to the first error so kd doesn't jump on the first loop
+	double integral = 0;
+	int settled = 0;
+	double most_past = 0;      // farthest the IMU saw the robot go past the final angle (for debugging)
+	uint32_t start_ms = pros::millis();
 
-	int settled_ms = 0;
-	for (int elapsed = 0; elapsed < timeout_ms; elapsed += LOOP_MS) {
-		double error         = inches - (drive_position_inches() - start_inches);
-		double heading_error = wrap_180(target_heading - imu.get_heading());
+	while (settled < settle_loops && pros::millis() - start_ms < static_cast<uint32_t>(timeout_ms)) {
+		double angle = imu.get_rotation();
+		double error = dest_angle - angle; // degrees left to turn (+ = keep turning right)
 
-		double power      = std::clamp(drive_pid.update(error), -(double)max_speed, (double)max_speed);
-		double correction = heading_pid.update(heading_error);
+		if (std::fabs(error) < i_zone) {
+			integral += error;
+		} else {
+			integral = 0;
+		}
+		if (error * last_error < 0) {
+			integral = 0; // just crossed the target, so drop the built-up I or it pushes the robot past
+		}
 
-		set_drive(power + correction, power - correction);
+		double derivative = error - last_error;
+		last_error = error;
 
-		settled_ms = (std::fabs(error) < DRIVE_TOLERANCE) ? settled_ms + LOOP_MS : 0;
-		if (settled_ms >= SETTLE_TIME_MS) break;
+		double power = (error * kp) + (integral * ki) + (derivative * kd);
+		power = std::clamp(power, -max_power, max_power);
+		spin_drive_voltage_percent(power, -power);
 
-		pros::delay(LOOP_MS);
+		most_past = std::max(most_past, (delta < 0) ? error : -error);
+		settled = (std::fabs(error) < tolerance) ? settled + 1 : 0;
+
+		if (print_debug) {
+			printf("%.3f, %.1f, %.1f, %.1f\n", (pros::millis() - start_ms) / 1000.0, angle, error, power);
+		}
+		pros::delay(10); // the IMU updates every 10 ms
+	}
+	stop_drive();
+
+	if (print_debug) {
+		const char* result = (settled >= settle_loops) ? "settled" : "TIMED OUT";
+		double off = dest_angle - imu.get_rotation();
+		printf("turn %s, %.1f degrees off, went %.1f past\n", result, off, most_past);
+		// Same thing on the brain screen, so no cable is needed
+		pros::lcd::print(3, "turn %s  off %.1f  past %.1f", result, off, most_past);
+	}
+}
+
+
+void pid_straight(double distance, bool lowerml = false, double lowermlerror = 0) {
+	double kp = 0.1;           // correction per motor degree the robot is behind / ahead of the profile
+	double kd = 0.4;           // damps that correction
+	double tolerance = 2.0;    // motor degrees from the end that counts as "there"
+	double max_speed = 35.0;   // cruise speed, percent of top speed
+	double max_accel = 90.0;  // speed ramp, percent per second (150 = 0 to 40% in about 0.27 s)
+	double heading_kp = 1.0;   // steering, percent per degree the robot has turned off course
+	double heading_tolerance = 1.0; // degrees off course that still counts as "straight"
+
+	MotionProfile profile(distance, percent_to_deg_per_sec(max_speed), percent_to_deg_per_sec(max_accel));
+	double timeout = profile.total_time + 1.0; // give up 1 s after the move should have finished
+
+	double lastError = 0;
+	int tolerance_count = 0;
+
+	left_drive.tare_position_all();
+	right_drive.tare_position_all();
+	double start_heading = imu.get_rotation(); // hold this heading for the whole move
+	uint32_t start_ms = pros::millis();
+
+	while (tolerance_count < 5) {
+		double t = (pros::millis() - start_ms) / 1000.0;
+		if (t > timeout) break;
+
+		ProfilePoint target = profile.sample(t);
+		double lpos = average(left_drive.get_position_all());
+		double rpos = average(right_drive.get_position_all());
+		double pos = (lpos + rpos) / 2;
+
+		double error = target.pos - pos; // + = behind the profile, - = ahead
+		double derivative = error - lastError;
+		lastError = error;
+
+		// Feedforward (the profile's speed) does most of the work; PID fixes the rest
+		double power = deg_per_sec_to_percent(target.vel) + (error * kp) + (derivative * kd);
+		power = std::clamp(power, -100.0, 100.0);
+
+		// Steer back to the starting heading. + = robot has turned left, so speed up the left
+		// side and slow the right side (works the same driving forward or backward).
+		double heading_error = start_heading - imu.get_rotation();
+		double steer = heading_error * heading_kp;
+		spin_drive_percent(power + steer, power - steer);
+
+		// Only finished once the profile is done AND the robot is at the end AND pointing straight
+		double remaining = distance - pos;
+		if (t >= profile.total_time && std::fabs(remaining) < tolerance &&
+		    std::fabs(heading_error) < heading_tolerance) {
+			tolerance_count++;
+		}
+		else {
+			tolerance_count = 0;
+		}
+
+		if (lowerml && std::fabs(remaining) < lowermlerror) {
+			mlmech.set_value(true);
+		}
+		pros::delay(15);
 	}
 	stop_drive();
 }
 
-// Turn in place to face an absolute heading (0 = starting direction, 90 = right, -90 or 270 = left).
-// Always takes the shortest way around.
-void turn_to_heading(double target_heading, int max_speed = 127, int timeout_ms = 2000) {
-	turn_pid.reset(wrap_180(target_heading - imu.get_heading()));
-
-	int settled_ms = 0;
-	for (int elapsed = 0; elapsed < timeout_ms; elapsed += LOOP_MS) {
-		double error = wrap_180(target_heading - imu.get_heading());
-		double power = std::clamp(turn_pid.update(error), -(double)max_speed, (double)max_speed);
-
-		set_drive(power, -power); // positive power turns right (clockwise)
-
-		settled_ms = (std::fabs(error) < TURN_TOLERANCE) ? settled_ms + LOOP_MS : 0;
-		if (settled_ms >= SETTLE_TIME_MS) break;
-
-		pros::delay(LOOP_MS);
-	}
-	stop_drive();
-}
-
-// Turn left (negative) or right (positive) by some number of degrees from where you are now
-void turn_by(double degrees, int max_speed = 127, int timeout_ms = 2000) {
-	turn_to_heading(imu.get_heading() + degrees, max_speed, timeout_ms);
+// Turn to face an absolute heading (0 = starting direction, 90 = right, -90 or 270 = left),
+// taking the shortest way around.
+void pid_turn_to(double target_heading) {
+	pid_turn(wrap_180(target_heading - imu.get_heading()));
 }
 
 // Turn to face the point (x, y), then drive to it.
 // Set reverse = true to back into the point instead (the back of the robot faces it).
-void move_to_point(double x, double y, bool reverse = false, int max_speed = 127) {
+void move_to_point(double x, double y, bool reverse = false) {
 	pose_mutex.lock();
 	double dx = x - robot_x;
 	double dy = y - robot_y;
 	pose_mutex.unlock();
 
-	if (std::hypot(dx, dy) < DRIVE_TOLERANCE) return; // already there
+	if (std::hypot(dx, dy) < 2.0 * INCHES_PER_DEGREE) return; // already there (same as pid_straight's tolerance)
 
 	double angle = std::atan2(dy, dx) * 180.0 / PI;
 	if (reverse) angle += 180.0;
-	turn_to_heading(angle, max_speed);
+	pid_turn_to(angle);
 
 	// Re-measure after the turn, since turning can nudge the robot a little
 	pose_mutex.lock();
 	double distance = std::hypot(x - robot_x, y - robot_y);
 	pose_mutex.unlock();
 
-	drive_distance(reverse ? -distance : distance, max_speed);
+	pid_straight((reverse ? -distance : distance) / INCHES_PER_DEGREE);
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous selector
+// Pick which autonomous runs with any of these:
+//   - the LEFT / RIGHT buttons at the bottom of the brain screen
+//   - tapping anywhere on the left or right half of the brain screen
+//   - the LEFT / RIGHT arrow buttons on the controller
+// The current pick shows on line 5 and on the controller screen. Defaults to RIGHT.
+// ---------------------------------------------------------------------------
+enum class Auton { LEFT, RIGHT };
+Auton selected_auton = Auton::RIGHT;
+bool auton_picked = false; // becomes true when LEFT or RIGHT is picked
+
+void show_selected_auton() {
+	const char* name = (selected_auton == Auton::LEFT) ? "LEFT " : "RIGHT";
+	pros::lcd::print(5, "Auton: %s", name);
+	master.print(0, 0, "Auton: %s", name);
+}
+
+void select_left_auton() {
+	selected_auton = Auton::LEFT;
+	auton_picked = true;
+	show_selected_auton();
+}
+
+void select_right_auton() {
+	selected_auton = Auton::RIGHT;
+	auton_picked = true;
+	show_selected_auton();
+}
+
+// Shows the selector and waits here until LEFT or RIGHT is picked (screen or controller).
+void wait_for_auton_pick() {
+	auton_picked = false;
+	pros::lcd::set_text(4, "Pick auton: tap screen or ctrl < >");
+
+	// Only count taps that start after this point, so a finger already on the screen doesn't pick
+	int32_t last_press_count = pros::screen::touch_status().press_count;
+
+	while (!auton_picked) {
+		if (master.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_LEFT))  select_left_auton();
+		if (master.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_RIGHT)) select_right_auton();
+
+		// Reads the touchscreen directly, so this works even if the on-screen buttons miss the tap
+		pros::screen_touch_status_s_t touch = pros::screen::touch_status();
+		if (touch.touch_status != pros::E_TOUCH_ERROR && touch.press_count != last_press_count) {
+			last_press_count = touch.press_count;
+			if (touch.x < 240) { // screen is 480 px wide
+				select_left_auton();
+			} else {
+				select_right_auton();
+			}
+		}
+
+		pros::delay(20);
+	}
+	pros::lcd::clear_line(4);
+}
+
+void left_auton() {
+	claw.set_brake_mode(pros::MotorBrake::hold);
+	set_pose(0, 0, 0);
+	claw.move(-CLAW_SPEED);
+	pid_straight(3 / INCHES_PER_DEGREE);
+	pid_straight(-4 / INCHES_PER_DEGREE);
+	pid_straight(4 / INCHES_PER_DEGREE);
+	pid_straight(-4 / INCHES_PER_DEGREE);
+	pid_straight(16 / INCHES_PER_DEGREE);
+
+	pid_turn(-90);
+
+	joint.move_absolute(-800, 50);
+	uint32_t joint_start_ms = pros::millis();
+	while (std::fabs(joint.get_position() - 45) > 5 && pros::millis() - joint_start_ms < 1500) {
+		pros::delay(10);
+	}
+
+	pid_straight(16.25/INCHES_PER_DEGREE);
+	claw.brake();
+	pros::delay(50);
+	claw.move(CLAW_SPEED/5);
+	pros::delay(900);
+	claw.brake();
+	pid_straight(-6.25/INCHES_PER_DEGREE);
+	pid_turn(90);
+	pid_straight(40/INCHES_PER_DEGREE);
+	
+}
+
+void right_auton() {
+	set_pose(0, 0, 0);
+
+	claw.move(-CLAW_SPEED);
+	pid_straight(3 / INCHES_PER_DEGREE);
+	pid_straight(-4 / INCHES_PER_DEGREE);
+	pid_straight(4 / INCHES_PER_DEGREE);
+	pid_straight(-4 / INCHES_PER_DEGREE);
+	pid_straight(16.25 / INCHES_PER_DEGREE);
+
+	pid_turn(90);
+
+	// move_absolute only sets a target and returns right away, so wait here until the joint
+	// gets there (or 1.5 s passes). Velocity must be positive: the target decides the direction.
+	joint.move_absolute(-750, 50);
+	uint32_t joint_start_ms = pros::millis();
+	while (std::fabs(joint.get_position() - 45) > 5 && pros::millis() - joint_start_ms < 1500) {
+		pros::delay(10);
+	}
+
+	pid_straight(16.25/INCHES_PER_DEGREE);
+	claw.brake();
+	pros::delay(50);
+	claw.move(CLAW_SPEED/5);
+	pros::delay(900);
+	claw.brake();
+	pid_straight(-6.25/INCHES_PER_DEGREE);
+	pid_turn(-90);
+	pid_straight(40/INCHES_PER_DEGREE);
 }
 
 /**
@@ -267,11 +477,18 @@ void initialize() {
 	pros::lcd::initialize();
 	pros::lcd::set_text(1, "Override Comp Code");
 
+	// Auton selector: left screen button = LEFT, right screen button = RIGHT
+	pros::lcd::register_btn0_cb(select_left_auton);
+	pros::lcd::register_btn2_cb(select_right_auton);
+	pros::lcd::set_text(7, "< LEFT               RIGHT >");
+	show_selected_auton();
+
 	// Drive coasts when sticks are released; lift holds its position
 	left_drive.set_brake_mode_all(pros::MotorBrake::coast);
 	right_drive.set_brake_mode_all(pros::MotorBrake::coast);
 	lift.set_brake_mode_all(pros::MotorBrake::hold);
 	joint.set_brake_mode(pros::MotorBrake::hold);
+	joint.tare_position(); // joint's current spot = 0, so move_absolute targets are measured from here
 	claw.set_brake_mode(pros::MotorBrake::hold); // claw stays where it stopped
 
 	// Encoders report in degrees (what drive_position_inches() expects)
@@ -284,6 +501,14 @@ void initialize() {
 
 	// Start tracking x / y in the background
 	pros::Task odom_task(track_position, "odometry");
+
+	// Pre-auton auton pick when NOT plugged into a field / competition switch.
+	// When plugged in, competition_initialize() does the pick instead, so initialize()
+	// never sits here waiting during a real match. Done after IMU calibration so tapping
+	// the screen can't shake the robot while the IMU calibrates.
+	if (!pros::competition::is_connected()) {
+		wait_for_auton_pick();
+	}
 }
 
 /**
@@ -302,7 +527,11 @@ void disabled() {}
  * This task will exit when the robot is enabled and autonomous or opcontrol
  * starts.
  */
-void competition_initialize() {}
+void competition_initialize() {
+	// Pre-auton auton pick on a field / competition switch. If nobody picks before the
+	// match starts, this gets stopped automatically and RIGHT runs.
+	wait_for_auton_pick();
+}
 
 /**
  * Runs the user autonomous code.
@@ -311,28 +540,37 @@ void autonomous() {
 	// Brake (instead of coast) so the robot stops exactly where PID tells it to
 	left_drive.set_brake_mode_all(pros::MotorBrake::brake);
 	right_drive.set_brake_mode_all(pros::MotorBrake::brake);
+	joint.set_brake_mode(pros::MotorBrake::hold);
 
-	set_pose(0, 0, 0); // robot starts at x = 0, y = 0, facing forward
-
-	// Example route - replace with your own
-	drive_distance(24);                
-	turn_to_heading(90);               
-	move_to_point(24, 24);             
-	move_to_point(0, 0, true);         
-	turn_to_heading(0);               
-
+	if (selected_auton == Auton::LEFT) {
+		left_auton();
+	} else {
+		right_auton();
+	}
 }
 
 void opcontrol() {
-	// Autonomous switches the drive to brake; go back to coast for driving
-	left_drive.set_brake_mode_all(pros::MotorBrake::coast);
-	right_drive.set_brake_mode_all(pros::MotorBrake::coast);
-
 	int claw_direction = 0; // 1 = spinning from X, -1 = spinning from Y, 0 = stopped
 
-	while (true) {
-		//autonomous();
+	// TEMP test: runs once when driver control starts. Must stay OUTSIDE the while loop,
+	// or it re-runs every loop and the robot moves in tiny start/stop steps.
+	// Uses brake mode like autonomous, so it stops the same way it will in a match.
+	// Skipped when plugged into a field / competition switch, so it can't run in a real match.
+	if (!pros::competition::is_connected()) {
+		left_drive.set_brake_mode_all(pros::MotorBrake::brake);
+		right_drive.set_brake_mode_all(pros::MotorBrake::brake);
+		joint.set_brake_mode(pros::MotorBrake::hold);
 
+		// The auton was already picked in pre-auton (end of initialize)
+		pros::delay(1000);     // 1 s to get your hand off the robot before it moves
+		autonomous();          // run the picked autonomous once at the start of driver control
+
+		// Autonomous switches the drive to brake; go back to coast for driving
+		left_drive.set_brake_mode_all(pros::MotorBrake::coast);
+		right_drive.set_brake_mode_all(pros::MotorBrake::coast);
+	}
+
+	while (true) {
 		int forward = apply_deadband(master.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y));
 		int turn    = apply_deadband(master.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_X));
 
